@@ -218,49 +218,70 @@ async def fetch_legislators_page(
     page: int = 1,
     limit: int = 100
 ) -> tuple[list, int, int | None]:
-    """抓取單頁立委清單，回傳 (解析後資料, 原始筆數, 總頁數)"""
+    """抓取單頁立委清單，回傳 (解析後資料, 原始筆數, 總頁數)；失敗時解析後資料為 None"""
     url = f"{LY_API_BASE}/legislators"
     params = {"page": page, "limit": limit}
+    max_attempts = 5
 
-    async with sem:
+    for attempt in range(1, max_attempts + 1):
+        retry_after = None
+        async with sem:
+            try:
+                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                    if resp.status == 429 or resp.status >= 500:
+                        # 被限流或伺服器暫時錯誤：依 Retry-After（或指數退避）等待後重試
+                        try:
+                            retry_after = float(resp.headers.get("Retry-After", ""))
+                        except ValueError:
+                            retry_after = 2 ** attempt
+                    elif resp.status != 200:
+                        print(f"⚠️ 第 {page} 頁請求失敗: HTTP {resp.status}")
+                        return None, 0, None
+                    else:
+                        return parse_legislators_response(await resp.json(content_type=None))
+            except asyncio.TimeoutError:
+                print(f"⚠️ 第 {page} 頁請求逾時 (Timeout)，第 {attempt} 次")
+                retry_after = 2 ** attempt
+            except Exception as e:
+                print(f"⚠️ 載入第 {page} 頁時發生異常: {type(e).__name__} - {e}")
+                return None, 0, None
+            finally:
+                await asyncio.sleep(0.5)  # 每個請求之間稍作間隔，避免觸發限流
+
+        if attempt < max_attempts:
+            await asyncio.sleep(min(retry_after, 30))
+
+    print(f"⚠️ 第 {page} 頁重試 {max_attempts} 次仍失敗")
+    return None, 0, None
+
+
+def parse_legislators_response(data) -> tuple[list, int, int | None]:
+    raw_list = extract_list(data, "legislators", "data", "records", "results")
+    total_page = data.get("total_page") if isinstance(data, dict) else None
+
+    parsed = []
+    for r in raw_list:
+        if not isinstance(r, dict):
+            continue
+        name = pick(r, "委員姓名", "name", "mFName", "legislator_name")
+        if not name:
+            continue
+
         try:
-            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-                if resp.status != 200:
-                    print(f"⚠️ 第 {page} 頁請求失敗: HTTP {resp.status}")
-                    return [], 0, None
+            term_val = int(pick(r, "屆", "term"))
+        except (ValueError, TypeError):
+            term_val = None  # 屆期不明就不要假裝是現任
 
-                data = await resp.json(content_type=None)
-                raw_list = extract_list(data, "legislators", "data", "records", "results")
-                total_page = data.get("total_page") if isinstance(data, dict) else None
-
-                parsed = []
-                for r in raw_list:
-                    if not isinstance(r, dict):
-                        continue
-                    name = pick(r, "委員姓名", "name", "mFName", "legislator_name")
-                    if not name:
-                        continue
-
-                    try:
-                        term_val = int(pick(r, "屆", "term"))
-                    except (ValueError, TypeError):
-                        term_val = None  # 屆期不明就不要假裝是現任
-
-                    parsed.append({
-                        "name": str(name).strip(),
-                        "term": term_val,
-                        "party": str(pick(r, "黨籍", "party", "partyGroup", default="無黨籍")),
-                        "areaName": str(pick(r, "選區名稱", "areaName", "district", "zone", default="全國不分區")),
-                        "committee": pick(r, "委員會", "committee", "committees", default="院會 / 待分派"),
-                        "picUrl": pick(r, "照片位址", "picUrl", "image", "avatar", "pic"),
-                        "resigned": pick(r, "是否離職", default="否") == "是",
-                    })
-                return parsed, len(raw_list), total_page
-        except asyncio.TimeoutError:
-            print(f"⚠️ 第 {page} 頁請求逾時 (Timeout)")
-        except Exception as e:
-            print(f"⚠️ 載入第 {page} 頁時發生異常: {type(e).__name__} - {e}")
-        return [], 0, None
+        parsed.append({
+            "name": str(name).strip(),
+            "term": term_val,
+            "party": str(pick(r, "黨籍", "party", "partyGroup", default="無黨籍")),
+            "areaName": str(pick(r, "選區名稱", "areaName", "district", "zone", default="全國不分區")),
+            "committee": pick(r, "委員會", "committee", "committees", default="院會 / 待分派"),
+            "picUrl": pick(r, "照片位址", "picUrl", "image", "avatar", "pic"),
+            "resigned": pick(r, "是否離職", default="否") == "是",
+        })
+    return parsed, len(raw_list), total_page
 
 
 async def load_legislators_cache():
@@ -274,18 +295,19 @@ async def load_legislators_cache():
 
     # 關閉嚴格 SSL 驗證，避免 Python 本機環境缺少證書時報錯
     connector = aiohttp.TCPConnector(ssl=False)
-    sem = asyncio.Semaphore(4)  # 最多同時發送 4 個請求，防止觸發 API 限流
+    sem = asyncio.Semaphore(2)  # 最多同時 2 個請求；API 會對過快的請求回 HTTP 429
     limit = 100
 
     async with aiohttp.ClientSession(headers=headers, connector=connector) as session:
         # 1. 取得第一頁資料
         first_page, raw_count, total_page = await fetch_legislators_page(session, sem, page=1, limit=limit)
 
-        if not first_page:
+        if first_page is None:
             print("❌ 無法取得立委名單，請確認網路連線或 API 伺服器狀態。")
             return
 
         all_records = list(first_page)
+        failed_pages = []
         # API 會回傳 total_page（依 limit 計算，1656 筆 / 100 = 17 頁）
         max_pages = min(int(total_page), 50) if total_page else 25
 
@@ -299,7 +321,11 @@ async def load_legislators_cache():
                 )
 
                 last_page_reached = False
-                for p_data, p_raw, _ in results:
+                for p, (p_data, p_raw, _) in zip(batch_pages, results):
+                    if p_data is None:
+                        # 請求失敗不代表沒資料了，記下來但繼續抓後面的頁
+                        failed_pages.append(p)
+                        continue
                     all_records.extend(p_data)
                     if p_raw == 0 or (not total_page and p_raw < limit):
                         last_page_reached = True
@@ -314,6 +340,8 @@ async def load_legislators_cache():
             r for r in all_records if r.get("term") == CURRENT_TERM and not r.get("resigned")
         ]
 
+        if failed_pages:
+            print(f"⚠️ [LYAPI] 以下頁面載入失敗，歷任資料可能不完整：{failed_pages}")
         print(f"✅ [LYAPI] 成功載入全體委員資料共 {len(CACHED_ALL_LEGISLATORS)} 筆（現任第 {CURRENT_TERM} 屆: {len(CACHED_CURRENT_LEGISLATORS)} 位）")
 
 
