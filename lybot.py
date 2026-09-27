@@ -437,10 +437,12 @@ async def query_proposals(interaction: discord.Interaction, keyword: str):
 
     # 關鍵字剛好是委員姓名 → 用 API 支援的「提案人」篩選；否則做全文搜尋
     kw = keyword.strip()
-    if any(leg["name"] == kw for leg in CACHED_ALL_LEGISLATORS):
+    by_proposer = any(leg["name"] == kw for leg in CACHED_ALL_LEGISLATORS)
+    if by_proposer:
         params = {"提案人": kw, "limit": 10}
     else:
-        params = {"q": kw, "limit": 10}
+        # API 的 q 是逐字比對且依日期排序，多抓一些再於本地篩出真正含完整關鍵字的議案
+        params = {"q": kw, "limit": 100}
 
     try:
         async with aiohttp.ClientSession(headers=headers, connector=connector) as session:
@@ -454,6 +456,13 @@ async def query_proposals(interaction: discord.Interaction, keyword: str):
         return
 
     proposals = [p for p in extract_list(data, "bills", "data", "items") if isinstance(p, dict)]
+
+    if not by_proposer:
+        search_fields = ("議案名稱", "提案單位/提案委員", "提案人", "法律編號:str")
+        proposals = [
+            p for p in proposals
+            if any(kw in join_names(p.get(f), "") for f in search_fields)
+        ][:10]
 
     if not proposals:
         await interaction.followup.send(f"找不到與關鍵字「**{keyword}**」相關的提案。")
