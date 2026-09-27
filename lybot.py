@@ -446,4 +446,4 @@ async def query_proposals(interaction: discord.Interaction, keyword: str):
 
 
 if __name__ == "__main__":
-    bot.run(TOKEN)
+    bot.run(TOKEN)
