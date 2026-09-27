@@ -108,15 +108,21 @@ class ProposalPaginationView(discord.ui.View):
         proposers = pick(item, "提案人", "提案單位/提案委員", "proposers", "proposer", default=[])
         proposer_str = join_names(proposers, "未提供")
         status = pick(item, "議案狀態", "status", default="審議中")
+        category = pick(item, "議案類別", default="未提供")
+        progress_date = pick(item, "最新進度日期", default="未提供")
+        detail_url = pick(item, "url")
 
         embed = discord.Embed(
             title=f"📜 提案查詢結果：{self.keyword}",
-            color=discord.Color.teal()
+            color=discord.Color.teal(),
+            url=detail_url if isinstance(detail_url, str) and detail_url.startswith("http") else None
         )
         embed.add_field(name="案由", value=str(bill_name)[:1000], inline=False)
         embed.add_field(name="議案編號", value=str(bill_no), inline=True)
         embed.add_field(name="提案人/機關", value=str(proposer_str)[:200], inline=True)
         embed.add_field(name="目前狀態", value=str(status), inline=True)
+        embed.add_field(name="議案類別", value=str(category), inline=True)
+        embed.add_field(name="最新進度日期", value=str(progress_date), inline=True)
         embed.set_footer(text=f"第 {self.current_page + 1} 頁 / 共 {self.total_pages} 頁")
         return embed
 
@@ -429,9 +435,16 @@ async def query_proposals(interaction: discord.Interaction, keyword: str):
     connector = aiohttp.TCPConnector(ssl=False)
     url = f"{LY_API_BASE}/bills"
 
+    # 關鍵字剛好是委員姓名 → 用 API 支援的「提案人」篩選；否則做全文搜尋
+    kw = keyword.strip()
+    if any(leg["name"] == kw for leg in CACHED_ALL_LEGISLATORS):
+        params = {"提案人": kw, "limit": 10}
+    else:
+        params = {"q": kw, "limit": 10}
+
     try:
         async with aiohttp.ClientSession(headers=headers, connector=connector) as session:
-            async with session.get(url, params={"q": keyword.strip(), "limit": 10}, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 if resp.status != 200:
                     await interaction.followup.send(f"❌ 查詢失敗，API 回傳狀態碼：`HTTP {resp.status}`")
                     return
