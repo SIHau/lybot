@@ -1,4 +1,4 @@
-# 立法院查詢 Discord 機器人（lybot）
+# 立法院資訊搜尋機器人（lybot）
 
 用 Discord 斜線指令查詢立法委員資料、選區代表與立法院議案進度。資料來自 [立法院 API（LYAPI v2）](https://ly.govapi.tw/v2/)。
 
