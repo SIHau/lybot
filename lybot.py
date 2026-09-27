@@ -149,6 +149,8 @@ def build_legislator_embed(item: dict, title: str, color: discord.Color) -> disc
     embed.add_field(name="屆期", value=f"第 {term} 屆" if term else "未提供", inline=True)
     embed.add_field(name="政黨", value=item["party"], inline=True)
     embed.add_field(name="所屬選區", value=item["areaName"], inline=False)
+    if item.get("resigned"):
+        embed.add_field(name="任職狀態", value="已離職", inline=True)
     embed.add_field(name="委員會紀錄", value=join_names(item["committee"], "院會 / 待分派")[:1000], inline=False)
     pic_url = item.get("picUrl")
     if isinstance(pic_url, str) and pic_url.startswith("http"):
@@ -245,6 +247,7 @@ async def fetch_legislators_page(
                         "areaName": str(pick(r, "選區名稱", "areaName", "district", "zone", default="全國不分區")),
                         "committee": pick(r, "委員會", "committee", "committees", default="院會 / 待分派"),
                         "picUrl": pick(r, "照片位址", "picUrl", "image", "avatar", "pic"),
+                        "resigned": pick(r, "是否離職", default="否") == "是",
                     })
                 return parsed, len(raw_list), total_page
         except asyncio.TimeoutError:
@@ -277,10 +280,11 @@ async def load_legislators_cache():
             return
 
         all_records = list(first_page)
+        # API 會回傳 total_page（依 limit 計算，1656 筆 / 100 = 17 頁）
         max_pages = min(int(total_page), 50) if total_page else 25
 
-        # 2. 以「原始」筆數判斷是否還有下一頁（解析後可能因過濾而少於 limit）
-        if raw_count >= limit and max_pages > 1:
+        # 2. 有 total_page 就照它抓；沒有的話以「原始」筆數判斷是否還有下一頁
+        if (total_page or raw_count >= limit) and max_pages > 1:
             current_page = 2
             while current_page <= max_pages:
                 batch_pages = list(range(current_page, min(current_page + 5, max_pages + 1)))
@@ -291,7 +295,7 @@ async def load_legislators_cache():
                 last_page_reached = False
                 for p_data, p_raw, _ in results:
                     all_records.extend(p_data)
-                    if p_raw < limit:
+                    if p_raw == 0 or (not total_page and p_raw < limit):
                         last_page_reached = True
 
                 if last_page_reached:
@@ -299,7 +303,10 @@ async def load_legislators_cache():
                 current_page += 5
 
         CACHED_ALL_LEGISLATORS = all_records
-        CACHED_CURRENT_LEGISLATORS = [r for r in all_records if r.get("term") == CURRENT_TERM]
+        # 現任 = 第 11 屆且未離職
+        CACHED_CURRENT_LEGISLATORS = [
+            r for r in all_records if r.get("term") == CURRENT_TERM and not r.get("resigned")
+        ]
 
         print(f"✅ [LYAPI] 成功載入全體委員資料共 {len(CACHED_ALL_LEGISLATORS)} 筆（現任第 {CURRENT_TERM} 屆: {len(CACHED_CURRENT_LEGISLATORS)} 位）")
 
