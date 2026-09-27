@@ -210,6 +210,54 @@ class LegislatorPaginationView(discord.ui.View):
 
 
 # ==========================================
+# UI 元件：名單列表分頁 View（每頁多筆）
+# ==========================================
+class ListPaginationView(discord.ui.View):
+    def __init__(self, lines: list[str], title: str, header: str = "", per_page: int = 20):
+        super().__init__(timeout=120)
+        self.pages = [lines[i:i + per_page] for i in range(0, len(lines), per_page)] or [[]]
+        self.title = title
+        self.header = header
+        self.current_page = 0
+        self.total_pages = len(self.pages)
+        self.message: discord.Message | None = None
+        self.update_buttons()
+
+    def update_buttons(self):
+        self.prev_btn.disabled = (self.current_page == 0)
+        self.next_btn.disabled = (self.current_page >= self.total_pages - 1)
+
+    def create_embed(self) -> discord.Embed:
+        body = "\n".join(self.pages[self.current_page])
+        description = f"{self.header}\n\n{body}" if self.header else body
+        embed = discord.Embed(title=self.title, description=description[:4000], color=discord.Color.gold())
+        embed.set_footer(text=f"第 {self.current_page + 1} 頁 / 共 {self.total_pages} 頁")
+        return embed
+
+    @discord.ui.button(label="◀ 上一頁", style=discord.ButtonStyle.primary)
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page -= 1
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.create_embed(), view=self)
+
+    @discord.ui.button(label="下一頁 ▶", style=discord.ButtonStyle.primary)
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page += 1
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.create_embed(), view=self)
+
+    async def on_timeout(self):
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
+# ==========================================
 # LYAPI 資料載入模組
 # ==========================================
 async def fetch_legislators_page(
@@ -378,9 +426,12 @@ async def on_ready():
 
 
 # ==========================================
-# 指令 1：查詢立委
+# 指令 1：查詢立委（/立委 姓名、/立委 黨籍）
 # ==========================================
-@bot.tree.command(name="立委", description="查詢現任或歷任立法委員基本資料、選區與所屬委員會")
+legislator_group = app_commands.Group(name="立委", description="查詢立法委員資料")
+
+
+@legislator_group.command(name="姓名", description="依姓名查詢現任或歷任立法委員基本資料、選區與所屬委員會")
 @app_commands.describe(
     name="請輸入立法委員姓名（例如：黃國昌、王金平、柯建銘）",
     status="請選擇查詢現任或歷任委員（預設為現任）"
@@ -424,6 +475,142 @@ async def query_legislator(
         view = LegislatorPaginationView(records=matched, title=f"查詢結果: {search_name}")
         msg = await interaction.followup.send(embed=view.create_embed(), view=view)
         view.message = msg
+
+
+# 常見簡稱 → API 上的正式黨名
+PARTY_ALIASES = {
+    "民進黨": "民主進步黨",
+    "國民黨": "中國國民黨",
+    "民眾黨": "台灣民眾黨",
+    "時力": "時代力量",
+    "基進": "台灣基進",
+    "台聯": "台灣團結聯盟",
+}
+
+MOURNING_TEXT = "🕯️ 他們本屆不在國會裡面，讓我們一起為他們默哀"
+
+
+def resolve_party(text: str) -> str:
+    text = (text or "").strip()
+    return PARTY_ALIASES.get(text, text)
+
+
+def party_matches(record: dict, party: str) -> bool:
+    return record.get("party") == party
+
+
+def filter_by_party(party: str, term: int | None = None, area: str | None = None) -> list[dict]:
+    """第一層黨籍（必填）→ 第二層屆數（選填）→ 第三層選區（選填，可輸入部分名稱，例如「臺北市」）"""
+    area = (area or "").strip()
+    return [
+        r for r in CACHED_ALL_LEGISLATORS
+        if party_matches(r, party)
+        and (term is None or r.get("term") == term)
+        and (not area or area in r.get("areaName", ""))
+    ]
+
+
+async def party_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    current = current.strip()
+    target = resolve_party(current)
+    counts: dict[str, int] = {}
+    for r in CACHED_ALL_LEGISLATORS:
+        counts[r["party"]] = counts.get(r["party"], 0) + 1
+    parties = sorted(counts, key=lambda p: -counts[p])
+    return [
+        app_commands.Choice(name=p, value=p)
+        for p in parties
+        if not current or current in p or target in p
+    ][:25]
+
+
+async def term_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[int]]:
+    party = resolve_party(getattr(interaction.namespace, "party", "") or "")
+    records = filter_by_party(party) if party else CACHED_ALL_LEGISLATORS
+    terms = sorted({r["term"] for r in records if r.get("term")}, reverse=True)
+    return [
+        app_commands.Choice(name=f"第 {t} 屆", value=t)
+        for t in terms
+        if not current or str(current).strip() in str(t)
+    ][:25]
+
+
+async def area_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    party = resolve_party(getattr(interaction.namespace, "party", "") or "")
+    term = getattr(interaction.namespace, "term", None)
+    try:
+        term = int(term) if term else None
+    except (TypeError, ValueError):
+        term = None
+    records = filter_by_party(party, term) if party else CACHED_ALL_LEGISLATORS
+    areas = sorted({r["areaName"] for r in records if r.get("areaName")})
+    return [
+        app_commands.Choice(name=a, value=a)
+        for a in areas
+        if current.strip() in a
+    ][:25]
+
+
+@legislator_group.command(name="黨籍", description="依黨籍查詢立法委員，可再依屆數與選區篩選")
+@app_commands.describe(
+    party="第一層：黨籍（可輸入簡稱，例如：民進黨、國民黨、民眾黨）",
+    term="第二層：屆數（選填，不填則查詢歷屆）",
+    area="第三層：選區（選填，例如：全國不分區、臺北市第1選舉區，輸入「臺北市」可查全部臺北市選區）"
+)
+@app_commands.autocomplete(party=party_autocomplete, term=term_autocomplete, area=area_autocomplete)
+async def query_by_party(
+    interaction: discord.Interaction,
+    party: str,
+    term: app_commands.Range[int, 1, 99] | None = None,
+    area: str | None = None
+):
+    await interaction.response.defer()
+
+    if not CACHED_ALL_LEGISLATORS:
+        await load_legislators_cache()
+    if not CACHED_ALL_LEGISLATORS:
+        await interaction.followup.send("❌ 立委名冊尚未載入，請稍後再試。")
+        return
+
+    party_name = resolve_party(party)
+    party_records = filter_by_party(party_name)
+    if not party_records:
+        await interaction.followup.send(f"❌ 歷屆立委名單中找不到黨籍 **{party}**，請從下拉選單選擇。")
+        return
+
+    # 最新一屆完全沒有該黨委員 → 默哀
+    latest_term = max(r["term"] for r in CACHED_ALL_LEGISLATORS if r.get("term"))
+    mourning = not any(r.get("term") == latest_term for r in party_records)
+
+    matched = filter_by_party(party_name, term, area)
+
+    filters = [f"第 {term} 屆" if term else "歷屆"]
+    if area:
+        filters.append(area.strip())
+    title = f"🏛️ {party_name} 立委名單（{'・'.join(filters)}）"
+
+    if not matched:
+        text = f"找不到符合條件的委員：**{party_name}**／{'／'.join(filters)}"
+        if mourning:
+            text = f"{MOURNING_TEXT}\n\n{text}"
+        await interaction.followup.send(text)
+        return
+
+    matched.sort(key=lambda r: (-(r.get("term") or 0), r.get("areaName", ""), r["name"]))
+    lines = [
+        f"第 {r['term']} 屆｜**{r['name']}**｜{r['areaName']}{'（已離職）' if r.get('resigned') else ''}"
+        for r in matched
+    ]
+    header = f"共 {len(matched)} 筆"
+    if mourning:
+        header = f"{MOURNING_TEXT}\n\n{header}"
+
+    view = ListPaginationView(lines, title=title, header=header)
+    msg = await interaction.followup.send(embed=view.create_embed(), view=view)
+    view.message = msg
+
+
+bot.tree.add_command(legislator_group)
 
 
 # ==========================================
