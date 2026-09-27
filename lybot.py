@@ -40,11 +40,47 @@ def log_report(user: str, keyword: str, proposal_id: str = None, status: str = N
         )
 
 LY_API_BASE = "https://ly.govapi.tw/v2"
+CURRENT_TERM = 11
 CACHED_ALL_LEGISLATORS: list[dict] = []
 CACHED_CURRENT_LEGISLATORS: list[dict] = []
 
+
+def pick(d: dict, *keys, default=None):
+    """依序嘗試多個欄位名稱（LYAPI v2 使用中文欄位，保留英文欄位作為相容）"""
+    for k in keys:
+        v = d.get(k)
+        if v not in (None, "", [], {}):
+            return v
+    return default
+
+
+def join_names(value, default: str) -> str:
+    """把 list / dict / str 轉成可顯示的字串，避免印出 Python list 原始格式"""
+    if isinstance(value, list):
+        names = [str(v.get("name", v) if isinstance(v, dict) else v).strip() for v in value if v]
+        return "、".join(n for n in names if n) or default
+    return str(value).strip() or default if value else default
+
+
+def extract_list(data, *keys) -> list:
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        v = pick(data, *keys, default=[])
+        return v if isinstance(v, list) else []
+    return []
+
+
+class LyBot(commands.Bot):
+    async def setup_hook(self):
+        # setup_hook 只會執行一次；on_ready 在斷線重連時會重複觸發
+        init_db()
+        await load_legislators_cache()
+        await self.tree.sync()
+
+
 intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = LyBot(command_prefix="!", intents=intents)
 
 
 # ==========================================
@@ -67,16 +103,11 @@ class ProposalPaginationView(discord.ui.View):
     def create_embed(self) -> discord.Embed:
         item = self.proposals[self.current_page]
 
-        bill_name = item.get("billName") or item.get("title") or "無案由說明"
-        bill_no = item.get("billNo") or "未提供"
-
-        proposers = item.get("proposers") or item.get("proposer") or []
-        if isinstance(proposers, list):
-            proposer_str = "、".join([str(p.get("name", p) if isinstance(p, dict) else p) for p in proposers if p]) or "未提供"
-        else:
-            proposer_str = str(proposers)
-
-        status = item.get("status") or "審議中"
+        bill_name = pick(item, "議案名稱", "案由", "billName", "title", default="無案由說明")
+        bill_no = pick(item, "議案編號", "billNo", default="未提供")
+        proposers = pick(item, "提案人", "提案單位/提案委員", "proposers", "proposer", default=[])
+        proposer_str = join_names(proposers, "未提供")
+        status = pick(item, "議案狀態", "status", default="審議中")
 
         embed = discord.Embed(
             title=f"📜 提案查詢結果：{self.keyword}",
@@ -112,6 +143,19 @@ class ProposalPaginationView(discord.ui.View):
                 pass
 
 
+def build_legislator_embed(item: dict, title: str, color: discord.Color) -> discord.Embed:
+    embed = discord.Embed(title=f"👤 {item['name']} 委員資訊（{title}）", color=color)
+    term = item.get("term")
+    embed.add_field(name="屆期", value=f"第 {term} 屆" if term else "未提供", inline=True)
+    embed.add_field(name="政黨", value=item["party"], inline=True)
+    embed.add_field(name="所屬選區", value=item["areaName"], inline=False)
+    embed.add_field(name="委員會紀錄", value=join_names(item["committee"], "院會 / 待分派")[:1000], inline=False)
+    pic_url = item.get("picUrl")
+    if isinstance(pic_url, str) and pic_url.startswith("http"):
+        embed.set_thumbnail(url=pic_url)
+    return embed
+
+
 # ==========================================
 # UI 元件：立委歷屆/多結果分頁 View
 # ==========================================
@@ -130,34 +174,7 @@ class LegislatorPaginationView(discord.ui.View):
         self.next_btn.disabled = (self.current_page >= self.total_pages - 1)
 
     def create_embed(self) -> discord.Embed:
-        item = self.records[self.current_page]
-
-        leg_name = item.get("name", "未知")
-        term_num = item.get("term", "未提供")
-        party = item.get("party") or item.get("partyGroup") or "無黨籍"
-        area = item.get("areaName") or item.get("district") or item.get("zone") or "全國不分區"
-
-        committee_raw = item.get("committee") or item.get("committees") or "院會 / 待分派"
-        if isinstance(committee_raw, list):
-            clean_comms = [str(c.get("name", c) if isinstance(c, dict) else c).strip() for c in committee_raw if c]
-            committee_str = "、".join(clean_comms) if clean_comms else "院會 / 待分派"
-        else:
-            committee_str = str(committee_raw)
-
-        pic_url = item.get("picUrl") or item.get("image") or item.get("avatar")
-
-        embed = discord.Embed(
-            title=f"👤 {leg_name} 委員資訊 ({self.title})",
-            color=discord.Color.purple()
-        )
-        embed.add_field(name="屆期", value=f"第 {term_num} 屆", inline=True)
-        embed.add_field(name="政黨", value=party, inline=True)
-        embed.add_field(name="所屬選區", value=area, inline=False)
-        embed.add_field(name="委員會紀錄", value=committee_str[:1000], inline=False)
-
-        if pic_url:
-            embed.set_thumbnail(url=pic_url)
-
+        embed = build_legislator_embed(self.records[self.current_page], self.title, discord.Color.purple())
         embed.set_footer(text=f"第 {self.current_page + 1} 筆 / 共 {self.total_pages} 筆資料")
         return embed
 
@@ -188,12 +205,12 @@ class LegislatorPaginationView(discord.ui.View):
 # LYAPI 資料載入模組
 # ==========================================
 async def fetch_legislators_page(
-    session: aiohttp.ClientSession, 
-    sem: asyncio.Semaphore, 
-    page: int = 1, 
+    session: aiohttp.ClientSession,
+    sem: asyncio.Semaphore,
+    page: int = 1,
     limit: int = 100
-) -> list:
-    """從 API 抓取單頁立委清單（帶有並行保護與完整解析）"""
+) -> tuple[list, int, int | None]:
+    """抓取單頁立委清單，回傳 (解析後資料, 原始筆數, 總頁數)"""
     url = f"{LY_API_BASE}/legislators"
     params = {"page": page, "limit": limit}
 
@@ -202,104 +219,89 @@ async def fetch_legislators_page(
             async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=20)) as resp:
                 if resp.status != 200:
                     print(f"⚠️ 第 {page} 頁請求失敗: HTTP {resp.status}")
-                    return []
+                    return [], 0, None
 
-                data = await resp.json()
-
-                raw_list = []
-                if isinstance(data, dict):
-                    raw_list = (
-                        data.get("legislators")
-                        or data.get("data")
-                        or data.get("records")
-                        or data.get("results")
-                        or []
-                    )
-                elif isinstance(data, list):
-                    raw_list = data
+                data = await resp.json(content_type=None)
+                raw_list = extract_list(data, "legislators", "data", "records", "results")
+                total_page = data.get("total_page") if isinstance(data, dict) else None
 
                 parsed = []
                 for r in raw_list:
-                    name = r.get("name") or r.get("mFName") or r.get("legislator_name") or ""
+                    if not isinstance(r, dict):
+                        continue
+                    name = pick(r, "委員姓名", "name", "mFName", "legislator_name")
                     if not name:
                         continue
 
-                    term_val = r.get("term") or r.get("session") or 11
                     try:
-                        term_val = int(term_val)
+                        term_val = int(pick(r, "屆", "term"))
                     except (ValueError, TypeError):
-                        term_val = 11
-
-                    committee_raw = r.get("committee") or r.get("committees") or "院會 / 待分派"
-                    pic_url = r.get("picUrl") or r.get("image") or r.get("avatar") or r.get("pic")
+                        term_val = None  # 屆期不明就不要假裝是現任
 
                     parsed.append({
                         "name": str(name).strip(),
                         "term": term_val,
-                        "party": r.get("party") or r.get("partyGroup") or "無黨籍",
-                        "areaName": r.get("areaName") or r.get("district") or r.get("zone") or "全國不分區",
-                        "committee": committee_raw,
-                        "picUrl": pic_url
+                        "party": str(pick(r, "黨籍", "party", "partyGroup", default="無黨籍")),
+                        "areaName": str(pick(r, "選區名稱", "areaName", "district", "zone", default="全國不分區")),
+                        "committee": pick(r, "委員會", "committee", "committees", default="院會 / 待分派"),
+                        "picUrl": pick(r, "照片位址", "picUrl", "image", "avatar", "pic"),
                     })
-                return parsed
+                return parsed, len(raw_list), total_page
         except asyncio.TimeoutError:
             print(f"⚠️ 第 {page} 頁請求逾時 (Timeout)")
         except Exception as e:
             print(f"⚠️ 載入第 {page} 頁時發生異常: {type(e).__name__} - {e}")
-        return []
+        return [], 0, None
 
 
 async def load_legislators_cache():
     """安全分批載入全體立委名冊至快取"""
     global CACHED_ALL_LEGISLATORS, CACHED_CURRENT_LEGISLATORS
-    
+
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*"
     }
-    
+
     # 關閉嚴格 SSL 驗證，避免 Python 本機環境缺少證書時報錯
     connector = aiohttp.TCPConnector(ssl=False)
     sem = asyncio.Semaphore(4)  # 最多同時發送 4 個請求，防止觸發 API 限流
+    limit = 100
 
     async with aiohttp.ClientSession(headers=headers, connector=connector) as session:
         # 1. 取得第一頁資料
-        first_page = await fetch_legislators_page(session, sem, page=1, limit=100)
+        first_page, raw_count, total_page = await fetch_legislators_page(session, sem, page=1, limit=limit)
 
         if not first_page:
             print("❌ 無法取得立委名單，請確認網路連線或 API 伺服器狀態。")
             return
 
         all_records = list(first_page)
-        
-        # 2. 若第一頁筆數達到 100，以 5 頁為一組批次抓取後續資料
-        if len(first_page) >= 100:
-            current_page = 2
-            max_pages = 25
+        max_pages = min(int(total_page), 50) if total_page else 25
 
+        # 2. 以「原始」筆數判斷是否還有下一頁（解析後可能因過濾而少於 limit）
+        if raw_count >= limit and max_pages > 1:
+            current_page = 2
             while current_page <= max_pages:
                 batch_pages = list(range(current_page, min(current_page + 5, max_pages + 1)))
-                tasks = [fetch_legislators_page(session, sem, page=p, limit=100) for p in batch_pages]
-                results = await asyncio.gather(*tasks)
+                results = await asyncio.gather(
+                    *[fetch_legislators_page(session, sem, page=p, limit=limit) for p in batch_pages]
+                )
 
-                empty_encountered = False
-                for p_data in results:
-                    if p_data:
-                        all_records.extend(p_data)
-                        if len(p_data) < 100:
-                            empty_encountered = True
-                    else:
-                        empty_encountered = True
+                last_page_reached = False
+                for p_data, p_raw, _ in results:
+                    all_records.extend(p_data)
+                    if p_raw < limit:
+                        last_page_reached = True
 
-                if empty_encountered:
+                if last_page_reached:
                     break
-
                 current_page += 5
 
         CACHED_ALL_LEGISLATORS = all_records
-        CACHED_CURRENT_LEGISLATORS = [r for r in all_records if r.get("term") == 11]
+        CACHED_CURRENT_LEGISLATORS = [r for r in all_records if r.get("term") == CURRENT_TERM]
 
-        print(f"✅ [LYAPI] 成功載入全體委員資料共 {len(CACHED_ALL_LEGISLATORS)} 筆（現任第 11 屆: {len(CACHED_CURRENT_LEGISLATORS)} 位）")
+        print(f"✅ [LYAPI] 成功載入全體委員資料共 {len(CACHED_ALL_LEGISLATORS)} 筆（現任第 {CURRENT_TERM} 屆: {len(CACHED_CURRENT_LEGISLATORS)} 位）")
 
 
 DISTRICT_DATA = [
@@ -331,9 +333,6 @@ async def district_autocomplete(
 
 @bot.event
 async def on_ready():
-    init_db()
-    await load_legislators_cache()
-    await bot.tree.sync()
     print(f"🚀 機器人已成功啟動！登入身分：{bot.user}")
 
 
@@ -374,22 +373,11 @@ async def query_legislator(
         return
 
     # 依屆期由新到舊排序
-    matched.sort(key=lambda x: int(x.get("term", 0)), reverse=True)
+    matched.sort(key=lambda x: x.get("term") or 0, reverse=True)
 
     if len(matched) == 1:
-        target = matched[0]
-        embed = discord.Embed(
-            title=f"👤 {target['name']} 委員資訊（{mode_text}）",
-            color=discord.Color.blue() if mode == "current" else discord.Color.purple()
-        )
-        embed.add_field(name="屆期", value=f"第 {target['term']} 屆", inline=True)
-        embed.add_field(name="政黨", value=target["party"], inline=True)
-        embed.add_field(name="所屬選區", value=target["areaName"], inline=False)
-        embed.add_field(name="委員會紀錄", value=str(target["committee"])[:1000], inline=False)
-
-        if target.get("picUrl"):
-            embed.set_thumbnail(url=target["picUrl"])
-
+        color = discord.Color.blue() if mode == "current" else discord.Color.purple()
+        embed = build_legislator_embed(matched[0], mode_text, color)
         await interaction.followup.send(embed=embed)
     else:
         view = LegislatorPaginationView(records=matched, title=f"查詢結果: {search_name}")
@@ -440,16 +428,12 @@ async def query_proposals(interaction: discord.Interaction, keyword: str):
                 if resp.status != 200:
                     await interaction.followup.send(f"❌ 查詢失敗，API 回傳狀態碼：`HTTP {resp.status}`")
                     return
-                data = await resp.json()
+                data = await resp.json(content_type=None)
     except Exception as e:
         await interaction.followup.send(f"❌ 連線 API 發生異常：`{type(e).__name__} - {e}`")
         return
 
-    proposals = []
-    if isinstance(data, dict):
-        proposals = data.get("bills") or data.get("data") or data.get("items") or []
-    elif isinstance(data, list):
-        proposals = data
+    proposals = [p for p in extract_list(data, "bills", "data", "items") if isinstance(p, dict)]
 
     if not proposals:
         await interaction.followup.send(f"找不到與關鍵字「**{keyword}**」相關的提案。")
