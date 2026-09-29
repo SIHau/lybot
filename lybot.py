@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import asyncio
 import sqlite3
@@ -43,6 +44,7 @@ LY_API_BASE = "https://ly.govapi.tw/v2"
 CURRENT_TERM = 11
 CACHED_ALL_LEGISLATORS: list[dict] = []
 CACHED_CURRENT_LEGISLATORS: list[dict] = []
+CACHED_COMMITTEES: list[dict] = []  # [{"code": 26, "name": "社會福利及衛生環境委員會", "old": False}, ...]
 
 
 def pick(d: dict, *keys, default=None):
@@ -76,6 +78,7 @@ class LyBot(commands.Bot):
         # setup_hook 只會執行一次；on_ready 在斷線重連時會重複觸發
         init_db()
         await load_legislators_cache()
+        await load_committees_cache()
         await self.tree.sync()
 
 
@@ -215,6 +218,8 @@ class LegislatorPaginationView(discord.ui.View):
 class ListPaginationView(discord.ui.View):
     def __init__(self, lines: list[str], title: str, header: str = "", per_page: int = 20):
         super().__init__(timeout=120)
+        # 多行項目（例如議事錄影）之間空一行
+        self.separator = "\n\n" if any("\n" in line for line in lines) else "\n"
         self.pages = [lines[i:i + per_page] for i in range(0, len(lines), per_page)] or [[]]
         self.title = title
         self.header = header
@@ -228,7 +233,7 @@ class ListPaginationView(discord.ui.View):
         self.next_btn.disabled = (self.current_page >= self.total_pages - 1)
 
     def create_embed(self) -> discord.Embed:
-        body = "\n".join(self.pages[self.current_page])
+        body = self.separator.join(self.pages[self.current_page])
         description = f"{self.header}\n\n{body}" if self.header else body
         embed = discord.Embed(title=self.title, description=description[:4000], color=discord.Color.gold())
         embed.set_footer(text=f"第 {self.current_page + 1} 頁 / 共 {self.total_pages} 頁")
@@ -681,6 +686,233 @@ async def query_proposals(interaction: discord.Interaction, keyword: str):
     await asyncio.to_thread(log_report, user=interaction.user.name, keyword=keyword, status="success")
     msg = await interaction.followup.send(embed=view.create_embed(), view=view)
     view.message = msg
+
+
+# ==========================================
+# 指令 4：議事錄影 IVOD 搜尋
+# ==========================================
+API_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*"
+}
+
+
+async def load_committees_cache():
+    """載入委員會清單（約 18 筆），供 /議事錄影 的委員會選單使用"""
+    global CACHED_COMMITTEES
+    try:
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(headers=API_HEADERS, connector=connector) as session:
+            async with session.get(f"{LY_API_BASE}/committees", params={"limit": 100},
+                                   timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                if resp.status != 200:
+                    print(f"⚠️ 委員會清單載入失敗: HTTP {resp.status}")
+                    return
+                data = await resp.json(content_type=None)
+    except Exception as e:
+        print(f"⚠️ 委員會清單載入失敗: {type(e).__name__} - {e}")
+        return
+
+    committees = []
+    for c in extract_list(data, "committees"):
+        code, name = c.get("委員會代號"), c.get("委員會名稱")
+        if code is None or not name:
+            continue
+        committees.append({"code": int(code), "name": str(name), "old": c.get("委員會類別") == 3})
+    # 現行委員會排前面，國會改革前的舊委員會排後面
+    committees.sort(key=lambda c: (c["old"], c["code"]))
+    CACHED_COMMITTEES = committees
+    print(f"✅ [LYAPI] 成功載入委員會清單共 {len(committees)} 個")
+
+
+def committee_label(c: dict) -> str:
+    return f"{c['name']}（舊）" if c["old"] else c["name"]
+
+
+def resolve_committee(text: str) -> dict | None:
+    text = (text or "").strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return next((c for c in CACHED_COMMITTEES if c["code"] == int(text)), None)
+    return (next((c for c in CACHED_COMMITTEES if c["name"] == text), None)
+            or next((c for c in CACHED_COMMITTEES if text in c["name"]), None))
+
+
+async def committee_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    current = current.strip()
+    return [
+        app_commands.Choice(name=committee_label(c), value=str(c["code"]))
+        for c in CACHED_COMMITTEES
+        if current in c["name"]
+    ][:25]
+
+
+def parse_date(text: str) -> str | None:
+    """接受 2026-08-27、2026/8/27、20260827，回傳 API 使用的 YYYY-MM-DD；格式錯誤回傳 None"""
+    m = re.fullmatch(r"\s*(\d{4})[-/.]?(\d{1,2})[-/.]?(\d{1,2})\s*", text or "")
+    if not m:
+        return None
+    try:
+        return datetime(int(m[1]), int(m[2]), int(m[3])).strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def format_duration(seconds) -> str:
+    try:
+        seconds = int(seconds)
+    except (TypeError, ValueError):
+        return "未知"
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def ivod_text(item: dict) -> str:
+    """議程比對用文字：會議名稱（含事由）與會議標題"""
+    meeting = item.get("會議資料") or {}
+    return f"{item.get('會議名稱', '')} {meeting.get('標題', '')}"
+
+
+def format_ivod_line(item: dict) -> str:
+    meeting = item.get("會議資料") or {}
+    date = item.get("日期") or "日期不明"
+    start = str(item.get("開始時間") or "")[11:16]
+    committees = join_names(meeting.get("委員會代碼:str"), "") or meeting.get("種類") or ""
+    speaker = item.get("委員名稱") or ""
+    kind = "完整會議" if item.get("影片種類") == "Full" else f"🎤 {speaker}"
+    name = str(item.get("會議名稱") or meeting.get("標題") or "未命名會議")
+    if len(name) > 90:
+        name = name[:90] + "…"
+    url = item.get("IVOD_URL") or ""
+    link = f"[▶ 觀看]({url})" if str(url).startswith("http") else ""
+    return (
+        f"**{date} {start}**｜{committees}｜{kind}｜{format_duration(item.get('影片長度'))}\n"
+        f"{name}\n{link}"
+    )
+
+
+@bot.tree.command(name="議事錄影", description="搜尋立法院議事錄影（IVOD），可依關鍵字、日期、委員會、議程篩選")
+@app_commands.describe(
+    keyword="關鍵字：輸入委員姓名可找該委員的發言片段，其他文字做全文搜尋",
+    date="日期（例如：2026-08-27、2026/8/27）",
+    committee="委員會（從選單選擇）",
+    agenda="議程：會議名稱或事由中的文字（例如：身心障礙者權益保障法）",
+    video_type="影片種類（預設全部）"
+)
+@app_commands.choices(video_type=[
+    app_commands.Choice(name="完整會議", value="Full"),
+    app_commands.Choice(name="委員發言片段", value="Clip"),
+])
+@app_commands.autocomplete(committee=committee_autocomplete)
+async def query_ivod(
+    interaction: discord.Interaction,
+    keyword: str | None = None,
+    date: str | None = None,
+    committee: str | None = None,
+    agenda: str | None = None,
+    video_type: app_commands.Choice[str] | None = None
+):
+    keyword = (keyword or "").replace('"', "").strip()
+    agenda = (agenda or "").replace('"', "").strip()
+
+    if not any([keyword, date, committee, agenda]):
+        await interaction.response.send_message(
+            "❌ 請至少填入一個條件：關鍵字、日期、委員會或議程。", ephemeral=True)
+        return
+
+    api_date = None
+    if date:
+        api_date = parse_date(date)
+        if not api_date:
+            await interaction.response.send_message(
+                f"❌ 無法辨識日期「{date}」，請使用 2026-08-27 或 2026/8/27 的格式。", ephemeral=True)
+            return
+
+    comm = None
+    if committee:
+        comm = resolve_committee(committee)
+        if not comm:
+            await interaction.response.send_message(
+                f"❌ 找不到委員會「{committee}」，請從下拉選單選擇。", ephemeral=True)
+            return
+
+    await interaction.response.defer()
+
+    params: dict = {}
+    if api_date:
+        params["日期"] = api_date
+    if comm:
+        params["會議資料.委員會代碼"] = comm["code"]
+    if video_type:
+        params["影片種類"] = video_type.value
+
+    # 關鍵字是委員姓名 → 用「委員名稱」篩選發言片段；其他關鍵字 → 全文詞組搜尋
+    by_speaker = bool(keyword) and any(leg["name"] == keyword for leg in CACHED_ALL_LEGISLATORS)
+    if by_speaker:
+        params["委員名稱"] = keyword
+
+    # 全文搜尋只能帶一個 q：優先用議程，關鍵字改在本地比對
+    local_keyword = ""
+    if agenda:
+        params["q"] = f'"{agenda}"'
+        if keyword and not by_speaker:
+            local_keyword = keyword
+    elif keyword and not by_speaker:
+        params["q"] = f'"{keyword}"'
+
+    needs_local = bool(agenda or local_keyword)
+    params["limit"] = 50 if needs_local else 20
+
+    try:
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(headers=API_HEADERS, connector=connector) as session:
+            async with session.get(f"{LY_API_BASE}/ivods", params=params,
+                                   timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                if resp.status != 200:
+                    await interaction.followup.send(f"❌ 查詢失敗，API 回傳狀態碼：`HTTP {resp.status}`")
+                    return
+                data = await resp.json(content_type=None)
+    except Exception as e:
+        await interaction.followup.send(f"❌ 連線 API 發生異常：`{type(e).__name__} - {e}`")
+        return
+
+    items = [i for i in extract_list(data, "ivods") if isinstance(i, dict)]
+
+    # API 沒有處理 q（回應裡沒有 query）時，關鍵字也改在本地比對
+    if "q" in params and isinstance(data, dict) and "query" not in data and keyword and not by_speaker:
+        local_keyword = keyword
+    if agenda:
+        items = [i for i in items if agenda in ivod_text(i)]
+    if local_keyword:
+        items = [i for i in items if local_keyword in f"{ivod_text(i)} {i.get('委員名稱', '')}"]
+
+    filters = []
+    if keyword:
+        filters.append(f"關鍵字：{keyword}")
+    if api_date:
+        filters.append(f"日期：{api_date}")
+    if comm:
+        filters.append(f"委員會：{committee_label(comm)}")
+    if agenda:
+        filters.append(f"議程：{agenda}")
+    if video_type:
+        filters.append(f"種類：{video_type.name}")
+    filter_text = "｜".join(filters)
+
+    if not items:
+        await interaction.followup.send(f"找不到符合條件的議事錄影（{filter_text}）。")
+        return
+
+    total = data.get("total") if isinstance(data, dict) and not needs_local else None
+    header = filter_text + (f"\n共 {total} 筆，顯示最新 {len(items)} 筆" if total and total > len(items) else f"\n共 {len(items)} 筆")
+    view = ListPaginationView([format_ivod_line(i) for i in items], title="🎬 議事錄影搜尋結果",
+                              header=header, per_page=5)
+    view_embed = view.create_embed()
+    msg = await interaction.followup.send(embed=view_embed, view=view)
+    view.message = msg
+    await asyncio.to_thread(log_report, user=interaction.user.name, keyword=f"[IVOD] {filter_text}", status="success")
 
 
 if __name__ == "__main__":
